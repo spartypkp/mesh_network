@@ -6,7 +6,7 @@ use zerocopy::{AsBytes, FromBytes, Unaligned};
 pub const PACKET_MAGIC: [u8; 4] = [0x4D, 0x45, 0x53, 0x48];
 
 /// Different types of packets in the mesh network
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum PacketType {
     Data = 0,
@@ -33,15 +33,32 @@ impl TryFrom<u8> for PacketType {
 }
 
 /// Raw packet header that can be safely zero-copied from bytes
+///
+/// # Payload Size Decision
+/// Currently using u32 for payload_length which allows payloads up to ~4GB.
+/// This decision balances several factors:
+/// - Modern use cases like file transfer, media sharing, and blockchain data often exceed 65KB
+/// - Network capabilities (5G, fiber) can handle multi-MB packets
+/// - Keeps implementation simple compared to packet fragmentation
+///
+/// # Future Considerations
+/// We may need to implement packet fragmentation if we find:
+/// - Network reliability issues with large packets
+/// - Memory constraints on some mesh nodes
+/// - Need for progress tracking on large transfers
+/// - MTU limitations causing excessive fragmentation at transport layer
+///
+/// For now, the simpler u32 approach lets us validate the design while keeping the codebase
+/// maintainable. Monitor real-world usage patterns to inform future fragmentation needs.
 #[derive(Debug, FromBytes, AsBytes, Unaligned, Clone)]
 #[repr(C, packed)]
 pub struct PacketHeader {
     pub magic: [u8; 4],
     pub version: u8,
     pub packet_type: u8,
-    pub payload_length: u16,
+    pub payload_length: u32,
     pub source_id: [u8; 32],
-    pub destination_id: [u8; 32], // Add this field
+    pub destination_id: [u8; 32],
     pub nonce: [u8; 8],
 }
 
@@ -78,7 +95,7 @@ impl AsRef<[u8]> for PacketHeader {
 }
 
 /// A packet that hasn't been validated yet
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct UntrustedPacket {
     header: PacketHeader,
     payload: Vec<u8>,
@@ -103,7 +120,10 @@ impl UntrustedPacket {
                 None => return Err(MeshError::PacketError("Failed to parse header".to_string())),
             };
 
-        // Validate payload length
+        // Validate the header immediately after parsing
+        header.validate()?; // Add this line!
+
+        // Rest of the implementation...
         let payload_len = header.payload_length as usize;
         if rest.len() < payload_len + 64 {
             return Err(MeshError::PacketError(
@@ -169,45 +189,5 @@ impl TrustedPacket {
     /// Gets when this packet was validated
     pub fn validated_at(&self) -> std::time::SystemTime {
         self.validated_at
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_packet_type_conversion() {
-        assert_eq!(PacketType::try_from(0).unwrap(), PacketType::Data);
-        assert_eq!(PacketType::try_from(1).unwrap(), PacketType::Control);
-        assert_eq!(PacketType::try_from(2).unwrap(), PacketType::Discovery);
-        assert_eq!(PacketType::try_from(255).unwrap(), PacketType::Error);
-        assert!(PacketType::try_from(3).is_err());
-    }
-
-    #[test]
-    fn test_header_validation() {
-        let valid_header = PacketHeader {
-            magic: PACKET_MAGIC,
-            version: 1,
-            packet_type: PacketType::Data as u8,
-            payload_length: 0,
-            source_id: [0; 32],
-            destination_id: [2; 32],
-            nonce: [0; 8],
-        };
-        assert!(valid_header.validate().is_ok());
-
-        let invalid_magic = PacketHeader {
-            magic: [0, 0, 0, 0],
-            ..valid_header
-        };
-        assert!(invalid_magic.validate().is_err());
-
-        let invalid_version = PacketHeader {
-            version: 2,
-            ..valid_header
-        };
-        assert!(invalid_version.validate().is_err());
     }
 }

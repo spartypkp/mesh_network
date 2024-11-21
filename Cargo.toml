@@ -9,6 +9,7 @@ zerocopy = "0.6"
 thiserror = "1.0"
 bytes = "1.0"
 tokio = { version = "1.0", features = ["full"] }
+serde_json = "1.0"
 
 [dev-dependencies]
 tokio-test = "0.4"

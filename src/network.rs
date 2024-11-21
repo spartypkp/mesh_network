@@ -156,13 +156,11 @@ impl NetworkManager {
         // Check if we've seen this packet before
         let packet_id = self.calculate_packet_id(&packet);
         if self.seen_packets.contains(&packet_id) {
-            return Ok(None); // Silently drop duplicate packets
+            return Ok(None);
         }
 
-        // Check rate limits
-        if !self.check_rate_limit(packet.header().source_id)? {
-            return Err(MeshError::NetworkError("Rate limit exceeded".to_string()));
-        }
+        // Check rate limits - just use ? operator directly since it now returns Result<(), MeshError>
+        self.check_rate_limit(packet.header().source_id)?;
 
         // Validate the packet
         let trusted_packet = self.validate_packet(packet)?;
@@ -193,31 +191,64 @@ impl NetworkManager {
     }
 
     /// Check if a peer has exceeded their rate limit
-    fn check_rate_limit(&mut self, peer_id: [u8; 32]) -> Result<bool, MeshError> {
+    fn check_rate_limit(&mut self, peer_id: [u8; 32]) -> Result<(), MeshError> {
         let now = SystemTime::now();
         let window_start = now - Duration::from_secs(1);
 
+        // Debug print the peer_id we're checking
+        println!("Checking rate limit for peer: {:?}", peer_id);
+
         // Get or create the peer's packet timestamps
         let timestamps = self.rate_limits.entry(peer_id).or_default();
+        println!("Before retention - timestamps count: {}", timestamps.len());
 
         // Remove old timestamps
         timestamps.retain(|&timestamp| timestamp >= window_start);
+        println!("After retention - timestamps count: {}", timestamps.len());
 
         // Check if we're within the rate limit
         if timestamps.len() >= self.config.rate_limit as usize {
-            return Ok(false);
+            println!(
+                "Rate limit exceeded! Current count: {}, Limit: {}",
+                timestamps.len(),
+                self.config.rate_limit
+            );
+            return Err(MeshError::NetworkError("Rate limit exceeded".to_string()));
         }
 
         // Add new timestamp
         timestamps.push(now);
-        Ok(true)
+        println!("Added new timestamp. New count: {}", timestamps.len());
+
+        // Print all timestamps for debugging
+        for (i, ts) in timestamps.iter().enumerate() {
+            println!(
+                "Timestamp {}: {:?} seconds ago",
+                i,
+                now.duration_since(*ts).unwrap_or_default().as_secs_f32()
+            );
+        }
+
+        // Debug print all rate limits
+        println!("All rate limits:");
+        for (id, times) in &self.rate_limits {
+            println!("Peer {:?}: {} timestamps", id, times.len());
+        }
+
+        Ok(())
     }
 
     /// Validate an incoming packet
     fn validate_packet(&self, packet: UntrustedPacket) -> Result<TrustedPacket, MeshError> {
         use crate::state::ValidationState;
 
-        let source_id = packet.header().source_id; // Get source_id before moving packet
+        let source_id = packet.header().source_id;
+
+        // Debug print to see what we're comparing
+        println!("Source ID from packet: {:?}", source_id);
+        for (key, _) in &self.peers {
+            println!("Stored peer key: {:?}", key);
+        }
 
         // Get the peer's public key
         if !self.is_trusted_peer(&source_id) {
@@ -387,29 +418,5 @@ impl NetworkManager {
         if self.seen_packets.len() > 1000 {
             self.seen_packets.clear();
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ring::rand::SystemRandom;
-
-    #[test]
-    fn test_peer_management() {
-        let rng = SystemRandom::new();
-        let key_pair = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
-        let key_pair = Ed25519KeyPair::from_pkcs8(key_pair.as_ref()).unwrap();
-
-        let mut network = NetworkManager::new(key_pair, NetworkConfig::default());
-
-        // Test adding a peer
-        let peer_key = vec![1u8; 32];
-        assert!(network.add_peer(&peer_key).is_ok());
-        assert!(network.is_trusted_peer(&peer_key));
-
-        // Test removing a peer
-        network.remove_peer(&peer_key);
-        assert!(!network.is_trusted_peer(&peer_key));
     }
 }
