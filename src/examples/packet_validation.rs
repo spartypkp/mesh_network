@@ -21,6 +21,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         packet_type: 0, // Data packet
         payload_length: 5,
         source_id: [1; 32],
+        destination_id: [2; 32],
         nonce: [0; 8],
     };
 

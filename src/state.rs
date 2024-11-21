@@ -4,6 +4,7 @@ use crate::{
     packet::{TrustedPacket, UntrustedPacket},
 };
 use ring::signature::{self, KeyPair, VerificationAlgorithm};
+use zerocopy::AsBytes;
 
 #[derive(Debug)]
 pub enum ValidationState {
@@ -54,7 +55,7 @@ impl ValidationState {
 
         // Create message to verify (header + payload)
         let mut message = Vec::new();
-        message.extend_from_slice(packet.header().as_ref());
+        message.extend_from_slice(packet.header().as_bytes());
         message.extend_from_slice(packet.payload());
 
         // Verify signature

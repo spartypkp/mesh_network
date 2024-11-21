@@ -41,6 +41,7 @@ pub struct PacketHeader {
     pub packet_type: u8,
     pub payload_length: u16,
     pub source_id: [u8; 32],
+    pub destination_id: [u8; 32], // Add this field
     pub nonce: [u8; 8],
 }
 
@@ -192,6 +193,7 @@ mod tests {
             packet_type: PacketType::Data as u8,
             payload_length: 0,
             source_id: [0; 32],
+            destination_id: [2; 32],
             nonce: [0; 8],
         };
         assert!(valid_header.validate().is_ok());

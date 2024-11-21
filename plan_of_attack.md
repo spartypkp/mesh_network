@@ -117,20 +117,23 @@ mesh_network/
 - [x] Error handling
 - [x] Basic packet parsing
 
-#### Phase 2: Validation Pipeline (In Progress)
+#### Phase 2: Validation Pipeline ✓
 - [x] Header validation
 - [x] Signature verification
 - [x] State machine implementation
-- [ ] Basic tests
+- [x] Basic tests
 
-#### Phase 3: Network Layer
-- [ ] Peer management
-- [ ] Packet forwarding
+#### Phase 3: Network Layer (In Progress)
+- [x] Peer management
+- [x] Basic routing logic
+- [x] Packet forwarding
+- [x] Rate limiting
+- [ ] Advanced routing algorithms
 - [ ] Network tests
 - [ ] Integration tests
 
 #### Phase 4: Security Hardening
-- [ ] Rate limiting
+- [x] Basic rate limiting
 - [ ] Replay attack prevention
 - [ ] Advanced validation rules
 - [ ] Security tests
@@ -140,8 +143,6 @@ mesh_network/
 - [ ] API documentation
 - [ ] Usage examples
 - [ ] Benchmarking
-
-
 ### Implemented Components
 
 #### 1. Packet Processing (`packet.rs`) ✓
@@ -177,6 +178,22 @@ mesh_network/
   - thiserror integration
   - Ring crypto error handling
 
+  #### 4. Network Management (`network.rs`) ✓
+- **Status**: Partially Complete
+- **Key Implementations**:
+  - `NetworkManager`: Core network management functionality
+  - `Peer`: Peer tracking and statistics
+  - `NetworkConfig`: Configurable network parameters
+  - `ForwardingDecision`: Packet routing logic
+  - `ForwardingMetadata`: Hop count and TTL tracking
+- **Features**:
+  - Peer addition/removal
+  - Trust verification
+  - Rate limiting
+  - Duplicate packet detection
+  - Basic packet forwarding
+  - Network maintenance
+
 ### Added Examples
 1. **Packet Parsing** (`examples/packet_parsing.rs`)
    - Demonstrates packet construction
@@ -188,6 +205,18 @@ mesh_network/
    - Key pair generation
    - Signature creation and verification
    - State machine transitions
+
+   3. **Network Management** (`examples/network_usage.rs`)
+   - Network configuration
+   - Peer management
+   - Packet handling
+   - Network maintenance
+
+4. **Packet Forwarding** (`examples/packet_forwarding.rs`)
+   - Multi-node setup
+   - Packet forwarding demonstration
+   - TTL and hop count handling
+   - Routing decisions
 
 ### Performance Considerations
 1. Zero-copy parsing for efficient memory usage
@@ -213,6 +242,7 @@ mesh_network/
 ### Contributing
 1. WillyD
 2. My boi Claude.
+3. Like 90% Claude.
 
 ### License
 Lol
