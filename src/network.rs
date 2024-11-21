@@ -419,4 +419,9 @@ impl NetworkManager {
             self.seen_packets.clear();
         }
     }
+
+    /// Get list of peer IDs
+    pub fn get_peers(&self) -> Vec<[u8; 32]> {
+        self.peers.keys().cloned().collect()
+    }
 }
