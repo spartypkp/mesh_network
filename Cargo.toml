@@ -4,3 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+ring = "0.16"
+zerocopy = "0.6"
+thiserror = "1.0"
+bytes = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
