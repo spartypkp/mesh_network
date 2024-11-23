@@ -1,193 +1,270 @@
-// src/packet.rs
-use crate::error::MeshError;
+// packet.rs
+#![no_std]
+
+use heapless::{FnvIndexMap, Vec as HVec};
 use zerocopy::{AsBytes, FromBytes, Unaligned};
 
-/// Magic bytes that every valid packet must start with ("MESH")
-pub const PACKET_MAGIC: [u8; 4] = [0x4D, 0x45, 0x53, 0x48];
+// Type aliases
+pub type PublicKey = [u8; 32];
+pub type Signature = [u8; 64];
 
-/// Different types of packets in the mesh network
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u8)]
-pub enum PacketType {
-    Data = 0,
-    Control = 1,
-    Discovery = 2,
-    Error = 255,
+// Constants
+const MAX_HOPS: usize = 8; // Maximum hops in path vector
+const MAX_AUTH_SIGS: usize = 4; // Maximum signatures in auth chain
+const MAX_CONTENT: usize = 1024; // Maximum content size
+
+/// Path vector for routing
+#[derive(Clone, Debug)]
+pub struct PathVector {
+    /// Sequence of hops to destination
+    hops: HVec<PublicKey, MAX_HOPS>,
+    /// Signatures validating the path
+    signatures: HVec<Signature, MAX_HOPS>,
 }
 
-impl TryFrom<u8> for PacketType {
-    type Error = MeshError;
-
-    fn try_from(value: u8) -> Result<Self, <Self as TryFrom<u8>>::Error> {
-        match value {
-            0 => Ok(PacketType::Data),
-            1 => Ok(PacketType::Control),
-            2 => Ok(PacketType::Discovery),
-            255 => Ok(PacketType::Error),
-            _ => Err(MeshError::PacketError(format!(
-                "Invalid packet type: {}",
-                value
-            ))),
+impl PathVector {
+    /// Create new empty path vector
+    pub fn new() -> Self {
+        Self {
+            hops: HVec::new(),
+            signatures: HVec::new(),
         }
+    }
+
+    /// Truncate path by removing first hop
+    pub fn truncate(&mut self) {
+        if !self.hops.is_empty() {
+            self.hops.remove(0);
+            self.signatures.remove(0);
+        }
+    }
+
+    /// Get next hop in path
+    pub fn next_hop(&self) -> Option<PublicKey> {
+        self.hops.first().copied()
     }
 }
 
-/// Raw packet header that can be safely zero-copied from bytes
-///
-/// # Payload Size Decision
-/// Currently using u32 for payload_length which allows payloads up to ~4GB.
-/// This decision balances several factors:
-/// - Modern use cases like file transfer, media sharing, and blockchain data often exceed 65KB
-/// - Network capabilities (5G, fiber) can handle multi-MB packets
-/// - Keeps implementation simple compared to packet fragmentation
-///
-/// # Future Considerations
-/// We may need to implement packet fragmentation if we find:
-/// - Network reliability issues with large packets
-/// - Memory constraints on some mesh nodes
-/// - Need for progress tracking on large transfers
-/// - MTU limitations causing excessive fragmentation at transport layer
-///
-/// For now, the simpler u32 approach lets us validate the design while keeping the codebase
-/// maintainable. Monitor real-world usage patterns to inform future fragmentation needs.
-#[derive(Debug, FromBytes, AsBytes, Unaligned, Clone)]
+/// Raw packet structure for zero-copy parsing
+#[derive(FromBytes, AsBytes, Debug, Unaligned)]
 #[repr(C, packed)]
 pub struct PacketHeader {
+    /// Magic bytes for validation
     pub magic: [u8; 4],
+    /// Protocol version
     pub version: u8,
-    pub packet_type: u8,
-    pub payload_length: u32,
-    pub source_id: [u8; 32],
-    pub destination_id: [u8; 32],
-    pub nonce: [u8; 8],
+    /// Content length
+    pub content_length: u16,
+    /// Number of hops in path
+    pub hop_count: u8,
+    /// Number of signatures in auth chain
+    pub sig_count: u8,
+    /// Source node
+    pub source: PublicKey,
+    /// Destination node
+    pub destination: PublicKey,
 }
 
-impl PacketHeader {
-    /// Validates the basic structure of the header
-    pub fn validate(&self) -> Result<(), MeshError> {
-        // Check magic bytes
-        if self.magic != PACKET_MAGIC {
-            return Err(MeshError::PacketError("Invalid magic bytes".to_string()));
-        }
-
-        // Check version
-        if self.version != 1 {
-            return Err(MeshError::PacketError(format!(
-                "Unsupported version: {}",
-                self.version
-            )));
-        }
-
-        // Validate packet type
-        PacketType::try_from(self.packet_type)?;
-
-        Ok(())
-    }
-}
-
-impl AsRef<[u8]> for PacketHeader {
-    fn as_ref(&self) -> &[u8] {
-        // Convert the header to its byte representation
-        unsafe {
-            std::slice::from_raw_parts(self as *const _ as *const u8, std::mem::size_of::<Self>())
-        }
-    }
-}
-
-/// A packet that hasn't been validated yet
-#[derive(Debug, Clone)]
-pub struct UntrustedPacket {
+/// Untrusted packet before validation
+#[derive(Debug)]
+pub struct Packet {
+    /// Packet header
     header: PacketHeader,
-    payload: Vec<u8>,
-    signature: [u8; 64], // Ed25519 signatures are 64 bytes
+    /// Routing path
+    path: PathVector,
+    /// Packet content
+    content: HVec<u8, MAX_CONTENT>,
+    /// Authorization chain
+    auth_chain: HVec<Signature, MAX_AUTH_SIGS>,
 }
 
-impl UntrustedPacket {
-    /// Attempts to parse an untrusted packet from raw bytes
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, MeshError> {
-        // Ensure we have enough bytes for the header
-        if bytes.len() < std::mem::size_of::<PacketHeader>() {
-            return Err(MeshError::PacketError(
-                "Packet too short for header".to_string(),
-            ));
-        }
-
-        // Parse header using zerocopy
-        let (header, rest) =
-            match zerocopy::LayoutVerified::<&[u8], PacketHeader>::new_unaligned_from_prefix(bytes)
-            {
-                Some((header, rest)) => (header.to_owned(), rest),
-                None => return Err(MeshError::PacketError("Failed to parse header".to_string())),
-            };
-
-        // Validate the header immediately after parsing
-        header.validate()?; // Add this line!
-
-        // Rest of the implementation...
-        let payload_len = header.payload_length as usize;
-        if rest.len() < payload_len + 64 {
-            return Err(MeshError::PacketError(
-                "Packet too short for payload and signature".to_string(),
-            ));
-        }
-
-        // Extract payload and signature
-        let payload = rest[..payload_len].to_vec();
-        let mut signature = [0u8; 64];
-        signature.copy_from_slice(&rest[payload_len..payload_len + 64]);
+impl Packet {
+    /// Create new packet
+    pub fn new(source: PublicKey, destination: PublicKey, content: &[u8]) -> Result<Self, Error> {
+        let mut packet_content = HVec::new();
+        packet_content
+            .extend_from_slice(content)
+            .map_err(|_| Error::PacketTooLarge)?;
 
         Ok(Self {
-            header,
-            payload,
-            signature,
+            header: PacketHeader {
+                magic: *b"MESH",
+                version: 1,
+                content_length: content.len() as u16,
+                hop_count: 0,
+                sig_count: 0,
+                source,
+                destination,
+            },
+            path: PathVector::new(),
+            content: packet_content,
+            auth_chain: HVec::new(),
         })
     }
 
-    /// Gets a reference to the header
-    pub fn header(&self) -> &PacketHeader {
-        &self.header
+    /// Parse packet from bytes
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        // Parse header using zerocopy
+        let (header, rest) =
+            zerocopy::LayoutVerified::<_, PacketHeader>::new_unaligned_from_prefix(bytes)
+                .ok_or(Error::InvalidFormat)?;
+
+        let header = header.read();
+
+        // Validate magic bytes
+        if header.magic != *b"MESH" {
+            return Err(Error::InvalidMagic);
+        }
+
+        // Parse path vector
+        let mut path = PathVector::new();
+        let mut offset = 0;
+
+        for _ in 0..header.hop_count {
+            let hop = PublicKey::try_from(&rest[offset..offset + 32])
+                .map_err(|_| Error::InvalidFormat)?;
+            path.hops.push(hop).map_err(|_| Error::TooManyHops)?;
+            offset += 32;
+        }
+
+        for _ in 0..header.hop_count {
+            let sig = Signature::try_from(&rest[offset..offset + 64])
+                .map_err(|_| Error::InvalidFormat)?;
+            path.signatures.push(sig).map_err(|_| Error::TooManyHops)?;
+            offset += 64;
+        }
+
+        // Parse content
+        let content_start = offset;
+        let content_end = content_start + header.content_length as usize;
+        let mut content = HVec::new();
+        content
+            .extend_from_slice(&rest[content_start..content_end])
+            .map_err(|_| Error::PacketTooLarge)?;
+
+        // Parse auth chain
+        let mut auth_chain = HVec::new();
+        offset = content_end;
+
+        for _ in 0..header.sig_count {
+            let sig = Signature::try_from(&rest[offset..offset + 64])
+                .map_err(|_| Error::InvalidFormat)?;
+            auth_chain.push(sig).map_err(|_| Error::TooManySignatures)?;
+            offset += 64;
+        }
+
+        Ok(Self {
+            header,
+            path,
+            content,
+            auth_chain,
+        })
     }
 
-    /// Gets a reference to the payload
-    pub fn payload(&self) -> &[u8] {
-        &self.payload
+    /// Convert packet to bytes
+    pub fn to_bytes(&self) -> Result<HVec<u8, 2048>, Error> {
+        let mut bytes = HVec::new();
+
+        // Write header
+        bytes
+            .extend_from_slice(self.header.as_bytes())
+            .map_err(|_| Error::PacketTooLarge)?;
+
+        // Write path vector
+        for hop in &self.path.hops {
+            bytes
+                .extend_from_slice(hop)
+                .map_err(|_| Error::PacketTooLarge)?;
+        }
+
+        for sig in &self.path.signatures {
+            bytes
+                .extend_from_slice(sig)
+                .map_err(|_| Error::PacketTooLarge)?;
+        }
+
+        // Write content
+        bytes
+            .extend_from_slice(&self.content)
+            .map_err(|_| Error::PacketTooLarge)?;
+
+        // Write auth chain
+        for sig in &self.auth_chain {
+            bytes
+                .extend_from_slice(sig)
+                .map_err(|_| Error::PacketTooLarge)?;
+        }
+
+        Ok(bytes)
     }
 
-    /// Gets a reference to the signature
-    pub fn signature(&self) -> &[u8; 64] {
-        &self.signature
+    // Getters
+    pub fn source(&self) -> PublicKey {
+        self.header.source
+    }
+    pub fn destination(&self) -> PublicKey {
+        self.header.destination
+    }
+    pub fn content(&self) -> &[u8] {
+        &self.content
+    }
+    pub fn auth_chain(&self) -> &[Signature] {
+        &self.auth_chain
+    }
+    pub fn path(&self) -> &PathVector {
+        &self.path
+    }
+    pub fn path_mut(&mut self) -> &mut PathVector {
+        &mut self.path
     }
 }
 
-/// A packet that has been validated and is safe to process
+/// Validated packet ready for processing
 #[derive(Debug)]
 pub struct TrustedPacket {
-    inner: UntrustedPacket,
-    validated_at: std::time::SystemTime,
+    inner: Packet,
 }
 
 impl TrustedPacket {
-    /// Creates a new trusted packet from an untrusted one
-    /// This should only be called after proper validation
-    pub(crate) fn from_untrusted(packet: UntrustedPacket) -> Self {
-        Self {
-            inner: packet,
-            validated_at: std::time::SystemTime::now(),
-        }
+    /// Create new trusted packet (should only be called after validation)
+    pub(crate) fn new(packet: Packet) -> Self {
+        Self { inner: packet }
     }
 
-    /// Gets a reference to the header
-    pub fn header(&self) -> &PacketHeader {
-        &self.inner.header
+    // Delegate getters to inner packet
+    pub fn content(&self) -> &[u8] {
+        self.inner.content()
     }
-
-    /// Gets a reference to the payload
-    pub fn payload(&self) -> &[u8] {
-        &self.inner.payload
+    pub fn source(&self) -> PublicKey {
+        self.inner.source()
     }
+}
 
-    /// Gets when this packet was validated
-    pub fn validated_at(&self) -> std::time::SystemTime {
-        self.validated_at
+#[derive(Debug)]
+pub enum Error {
+    InvalidMagic,
+    InvalidFormat,
+    PacketTooLarge,
+    TooManyHops,
+    TooManySignatures,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_packet_roundtrip() {
+        let content = b"Hello, mesh!";
+        let source = [1u8; 32];
+        let dest = [2u8; 32];
+
+        let packet = Packet::new(source, dest, content).unwrap();
+        let bytes = packet.to_bytes().unwrap();
+        let parsed = Packet::from_bytes(&bytes).unwrap();
+
+        assert_eq!(parsed.content(), content);
+        assert_eq!(parsed.source(), source);
+        assert_eq!(parsed.destination(), dest);
     }
 }

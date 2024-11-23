@@ -1,309 +1,273 @@
-// Like importing different parts of a web framework
-pub mod crypto; // Like SSL/TLS handling
-pub mod error; // Like HTTP error responses
-pub mod logging; // Like web server logging
-pub mod network; // Like network transport layer
-pub mod packet; // Like HTTP request/response
-pub mod routing; // Like URL routing
-pub mod state; // Like session state
-pub mod validate; // Like input validation
+// lib.rs
+#![no_std]
 
-use crypto::{CryptoConfig, CryptoManager};
-use error::MeshError;
-use logging::{LogConfig, LogLevel, Logger};
-use network::{ForwardingMetadata, NetworkConfig, NetworkManager};
-use packet::{PacketType, TrustedPacket, UntrustedPacket};
-use routing::{NodeId, Router, RouterConfig};
-use validate::ValidationRules;
-use zerocopy::AsBytes;
+extern crate alloc;
 
-/// Main mesh network node - like an Express.js app instance
-/// Think of this as your main web server that coordinates everything
-pub struct MeshNetwork {
-    crypto: CryptoManager,      // Like SSL certificate manager
-    network: NetworkManager,    // Like HTTP server
-    router: Router,             // Like URL router
-    validator: ValidationRules, // Like input validator
-    logger: Logger,             // Like Morgan/Winston logger
+use alloc::{string::String, vec::Vec};
+use core::{mem, slice, time::Duration};
+use hashbrown::HashMap;
+use ring::signature::{self, Ed25519KeyPair, KeyPair};
+use zerocopy::{AsBytes, FromBytes};
+
+// Internal modules
+pub mod auth;
+pub mod error;
+pub mod packet;
+
+// Re-exports
+pub use auth::{AuthTree, Rights};
+pub use error::{AuthError, Error, PacketError, RoutingError, TransmitError};
+pub use packet::{Packet, PathVector, PublicKey, Signature, TrustedPacket};
+
+/// Routing update information
+type RouteUpdate = (PublicKey, PathVector, Vec<Signature>);
+
+/// Time provider for no_std timestamp handling
+#[derive(Clone, Copy)]
+pub struct TimeProvider {
+    pub get_timestamp: fn() -> u64, // Unix timestamp in milliseconds
 }
 
-/// Configuration for the mesh network - like server config
-/// Similar to configuring Express.js with various options
-#[derive(Debug, Clone)]
-pub struct MeshConfig {
-    /// Like server hostname
-    pub node_name: String,
-    /// Like max connections limit
-    pub max_peers: usize,
-    /// Like max request body size
-    pub max_packet_size: usize,
-    /// Like log level (debug, info, etc)
-    pub log_level: LogLevel,
+/// Abstract interface for network transmission
+pub trait Transmitter {
+    /// Attempt to transmit bytes over the network
+    fn transmit(&mut self, bytes: &[u8]) -> Result<(), Error>;
+
+    /// Check if transmission is currently possible
+    fn can_transmit(&self) -> bool;
 }
 
-/// Default configuration - like default Express.js settings
-impl Default for MeshConfig {
-    fn default() -> Self {
+/// Internal routing table structure
+#[derive(Default)]
+struct RouteTable {
+    /// Full path vectors (only for routing nodes)
+    paths: HashMap<PublicKey, PathVector>,
+
+    /// Next hop for non-routing nodes
+    next_hop: Option<PublicKey>,
+}
+
+/// Main network implementation
+pub struct Network<T: Transmitter> {
+    /// Node's keypair for signing
+    keypair: Ed25519KeyPair,
+
+    /// Network's public key for validation
+    network_key: PublicKey,
+
+    /// Abstract transmitter implementation
+    transmitter: T,
+
+    /// Optional routing table (None for non-routing nodes)
+    routes: Option<RouteTable>,
+
+    /// Authorization tree for rights management
+    auth: AuthTree,
+
+    /// Whether this node is a router
+    is_router: bool,
+
+    /// Time provider for timestamp operations
+    time_provider: TimeProvider,
+}
+
+impl<T: Transmitter> Network<T> {
+    /// Create a new network instance
+    pub fn new(
+        transmitter: T,
+        keypair: Ed25519KeyPair,
+        network_key: [u8; 32],
+        is_router: bool,
+        time_provider: TimeProvider,
+    ) -> Self {
+        let routes = if is_router {
+            Some(RouteTable::default())
+        } else {
+            None
+        };
+
+        let rights = Rights {
+            can_route: is_router,
+            can_delegate: true,
+            can_authorize_routes: is_router,
+            expires_at: (time_provider.get_timestamp)() + 365 * 24 * 60 * 60 * 1000, // 1 year
+        };
+
+        // Get public key before moving keypair
+        let public_key = keypair.public_key().as_ref().try_into().unwrap();
+
         Self {
-            node_name: "mesh-node".to_string(), // Like "localhost"
-            max_peers: 10,                      // Like max_connections
-            max_packet_size: 1024 * 64,         // Like bodyParser limit
-            log_level: LogLevel::Info,          // Like LOG_LEVEL=info
+            auth: AuthTree::new(public_key, rights, time_provider.get_timestamp),
+            keypair, // keypair is moved here
+            network_key,
+            transmitter,
+            routes,
+            is_router,
+            time_provider,
+        }
+    }
+
+    /// Process incoming network packet
+    pub fn accept(&mut self, bytes: &[u8]) -> Option<TrustedPacket> {
+        // Parse packet
+        let mut packet = Packet::from_bytes(bytes).ok()?;
+
+        // Verify authorization chain
+        if self
+            .auth
+            .verify_chain(
+                &packet.auth_chain(),
+                Rights {
+                    can_route: true,
+                    can_delegate: false,
+                    can_authorize_routes: false,
+                    expires_at: (self.time_provider.get_timestamp)(),
+                },
+            )
+            .ok()?
+        {
+            return None;
+        }
+
+        // Handle based on destination
+        if packet.destination() == self.keypair.public_key().as_ref() {
+            self.process_local(packet)
+        } else {
+            // Forward packet
+            let _ = self.handle_forward(packet);
+            None
+        }
+    }
+
+    /// Send a message to a destination
+    pub fn send(&mut self, destination: PublicKey, content: &[u8]) -> Result<(), Error> {
+        // Create packet
+        let mut packet = Packet::new(
+            self.keypair.public_key().as_ref().to_vec(),
+            destination.to_vec(),
+            content.to_vec(),
+        )?;
+
+        // Add authorization chain
+        packet.set_auth_chain(self.auth.create_chain()?);
+
+        // Handle routing
+        if self.is_router {
+            self.compute_path(&mut packet)?;
+        }
+
+        // Transmit packet
+        self.transmitter.transmit(&packet.to_bytes()?)
+    }
+
+    /// Update routing table with new information
+    pub fn update_routes(&mut self, update: RouteUpdate) -> Result<(), Error> {
+        let (dest, path, signatures) = update;
+
+        // Verify update authorization
+        if !self.auth.verify_route_auth(&signatures).unwrap_or(false) {
+            return Err(Error::Auth(AuthError::InvalidSignature));
+        }
+
+        // Update routes based on node type
+        if self.is_router {
+            if let Some(routes) = &mut self.routes {
+                routes.paths.insert(dest, path);
+            }
+        } else {
+            if let Some(routes) = &mut self.routes {
+                routes.next_hop = path.hops.first().cloned();
+            }
+        }
+
+        Ok(())
+    }
+
+    // Private helper functions
+
+    /// Process locally destined packet
+    fn process_local(&self, packet: Packet) -> Option<TrustedPacket> {
+        Some(TrustedPacket::new(packet))
+    }
+
+    /// Handle packet forwarding
+    fn handle_forward(&mut self, mut packet: Packet) -> Result<(), Error> {
+        let next_hop = if let Some(routes) = &self.routes {
+            if self.is_router {
+                packet.path_ref().hops.first().cloned()
+            } else {
+                routes.next_hop.clone()
+            }
+        } else {
+            return Err(Error::Routing(RoutingError::NoRoute));
+        };
+
+        if let Some(hop) = next_hop {
+            if self.is_router {
+                packet.truncate_path();
+            }
+            self.transmitter.transmit(&packet.to_bytes()?)
+        } else {
+            Err(Error::Routing(RoutingError::NoRoute))
+        }
+    }
+
+    /// Compute path vector for routing nodes
+    fn compute_path(&self, packet: &mut Packet) -> Result<(), Error> {
+        if let Some(routes) = &self.routes {
+            if let Some(path) = routes.paths.get(&packet.destination()) {
+                packet.set_path(path.clone());
+                Ok(())
+            } else {
+                Err(Error::Routing(RoutingError::NoRoute))
+            }
+        } else {
+            Err(Error::Routing(RoutingError::NotRouter))
         }
     }
 }
 
-impl MeshNetwork {
-    /// Create new node - like creating new Express app
-    /// Similar to: const app = express()
-    pub async fn new(config: MeshConfig) -> Result<Self, MeshError> {
-        // Like generating SSL certificates
-        let keypair = CryptoManager::generate_keypair()?;
-        let crypto = CryptoManager::new(keypair);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        // Like setting up the HTTP server
-        let network = NetworkManager::new(
-            crypto.local_keypair_owned(),
-            NetworkConfig {
-                max_peers: config.max_peers,
-                ..Default::default()
-            },
-        );
-
-        // Like setting up the router
-        let router = Router::new(NodeId(crypto.node_id()), RouterConfig::default());
-
-        // Like setting up input validation
-        let validator = ValidationRules::new();
-
-        // Like setting up logging middleware
-        let (logger, log_receiver) = Logger::new(LogConfig {
-            min_level: config.log_level,
-            ..Default::default()
-        })
-        .await;
-
-        // Start logger (like starting Morgan logger)
-        tokio::spawn(log_receiver.run());
-
-        Ok(Self {
-            crypto,
-            network,
-            router,
-            validator,
-            logger,
-        })
+    // Mock transmitter for testing
+    struct MockTransmitter {
+        can_transmit: bool,
     }
 
-    /// Send message to specific node
-    /// Like making an HTTP POST request to specific server
-    pub async fn send_message(
-        &mut self,
-        target: [u8; 32], // Like target URL
-        message: &[u8],   // Like request body
-    ) -> Result<(), MeshError> {
-        self.logger.info("api", "Sending message").await;
-
-        // Create packet (like forming HTTP request)
-        let header = packet::PacketHeader {
-            magic: packet::PACKET_MAGIC,          // Like HTTP/1.1
-            version: 1,                           // Like API version
-            packet_type: PacketType::Data as u8,  // Like Content-Type
-            payload_length: message.len() as u32, // Like Content-Length
-            source_id: self.crypto.node_id(),     // Like From header
-            destination_id: target,               // Like To header
-            nonce: self.generate_nonce()?,        // Like request ID
-        };
-
-        // Sign message (like adding JWT)
-        let mut data = Vec::new();
-        data.extend_from_slice(header.as_bytes());
-        data.extend_from_slice(message);
-        let signature = self.crypto.sign(&data);
-
-        // Build packet (like assembling full HTTP request)
-        let mut packet_data = Vec::new();
-        packet_data.extend_from_slice(header.as_bytes());
-        packet_data.extend_from_slice(message);
-        packet_data.extend_from_slice(&signature);
-
-        // Find route and send (like DNS lookup + send)
-        let route = self
-            .router
-            .find_route(&NodeId(target))
-            .ok_or_else(|| MeshError::NetworkError("No route to target".to_string()))?;
-
-        // Convert to trusted packet (like validating request)
-        let untrusted = UntrustedPacket::from_bytes(&packet_data)?;
-        let trusted = TrustedPacket::from_untrusted(untrusted);
-
-        // Set metadata (like HTTP headers)
-        let metadata = ForwardingMetadata {
-            hop_count: 0, // Like TTL header
-            ttl: 255,     // Like max-forwards
-            priority: 1,  // Like priority header
-        };
-
-        // Forward packet (like sending HTTP request)
-        self.network.forward_packet(&trusted, metadata)?;
-
-        self.logger.info("api", "Message sent successfully").await;
-        Ok(())
-    }
-
-    /// Broadcast a message to all peers
-    /// Like sending a notification to all connected websocket clients
-    pub async fn broadcast(&mut self, message: &[u8]) -> Result<(), MeshError> {
-        self.logger.info("api", "Broadcasting message").await;
-
-        // [0xff; 32] is like the broadcast address "255.255.255.255" in IP networking
-        // Similar to sending a message to "/broadcast" endpoint
-        let broadcast_target = [0xff; 32];
-        self.send_message(broadcast_target, message).await
-    }
-
-    /// Handle an incoming packet
-    /// Like a main request handler middleware in Express
-    /// Similar to app.use((req, res, next) => {...})
-    pub async fn handle_packet(&mut self, data: &[u8]) -> Result<(), MeshError> {
-        self.logger.info("api", "Handling incoming packet").await;
-
-        // Parse incoming data - like body-parser middleware
-        let untrusted = UntrustedPacket::from_bytes(data)?;
-
-        // Validate packet - like validation middleware (express-validator)
-        self.validator.validate_packet(&untrusted)?;
-
-        // Verify signature - like JWT verification middleware
-        if !self.crypto.verify_packet(&untrusted)? {
-            return Err(MeshError::CryptoError("Invalid signature".to_string()));
-        }
-
-        // Route handling - like Express router
-        match untrusted.header().destination_id {
-            // Handle local request - like handling request for this server
-            id if id == self.crypto.node_id() => {
-                self.process_local_packet(untrusted).await?;
-            }
-            // Handle broadcast - like server-sent events to all clients
-            id if id == [0xff; 32] => {
-                // Process locally first
-                self.process_local_packet(untrusted.clone()).await?;
-
-                // Convert to trusted packet - like validating broadcast message
-                let trusted = TrustedPacket::from_untrusted(untrusted);
-
-                // Set metadata - like broadcast headers
-                let metadata = ForwardingMetadata {
-                    hop_count: 0, // Like starting hop count
-                    ttl: 255,     // Like maximum message lifetime
-                    priority: 1,  // Like message priority
-                };
-                self.network.forward_packet(&trusted, metadata)?;
-            }
-            // Forward to another node - like proxy_pass in nginx
-            _ => {
-                self.handle_forward(untrusted)?;
+    impl Transmitter for MockTransmitter {
+        fn transmit(&mut self, _bytes: &[u8]) -> Result<(), Error> {
+            if self.can_transmit {
+                Ok(())
+            } else {
+                Err(Error::Transmit(TransmitError::SendFailed))
             }
         }
 
-        self.logger.info("api", "Packet handled successfully").await;
-        Ok(())
-    }
-
-    /// Add a trusted peer
-    /// Like adding a trusted API client
-    pub fn add_peer(&mut self, public_key: &[u8]) -> Result<(), MeshError> {
-        // Convert public key to ID - like converting API key to client ID
-        let mut id = [0u8; 32];
-        id.copy_from_slice(public_key);
-
-        // Add to trusted peers - like adding to allowlist
-        self.crypto.add_trusted_peer(id, public_key.to_vec());
-        self.network.add_peer(public_key)
-    }
-
-    /// Remove a peer
-    /// Like revoking an API key
-    pub fn remove_peer(&mut self, public_key: &[u8]) {
-        let mut id = [0u8; 32];
-        id.copy_from_slice(public_key);
-
-        // Remove from trusted peers - like removing from allowlist
-        self.crypto.remove_trusted_peer(&id);
-        self.network.remove_peer(public_key);
-    }
-
-    /// Get list of connected peers
-    /// Like getting list of connected clients
-    pub fn get_peers(&self) -> Vec<[u8; 32]> {
-        self.network.get_peers()
-    }
-
-    /// Perform maintenance tasks
-    /// Like running cron jobs for cleanup
-    pub fn maintenance(&mut self) {
-        self.network.maintenance(); // Like cleaning up dead connections
-        self.router.maintenance(); // Like updating routing tables
-        self.validator.maintenance(); // Like clearing validation caches
-    }
-
-    // Private helper methods
-
-    /// Process a packet meant for this node
-    /// Like handling a request specifically for this server
-    async fn process_local_packet(&mut self, packet: UntrustedPacket) -> Result<(), MeshError> {
-        // Handle different packet types - like different HTTP methods
-        match packet.header().packet_type.try_into()? {
-            PacketType::Data => {
-                // Like handling POST/PUT data
-                self.logger.info("api", "Processing data packet").await;
-            }
-            PacketType::Control => {
-                // Like handling control commands (similar to HEAD/OPTIONS)
-                self.logger.info("api", "Processing control packet").await;
-            }
-            _ => {
-                // Like handling unknown HTTP method
-                self.logger.warning("api", "Unhandled packet type").await;
-            }
+        fn can_transmit(&self) -> bool {
+            self.can_transmit
         }
-        Ok(())
     }
 
-    /// Forward a packet to next hop
-    /// Like a reverse proxy forwarding request
-    fn handle_forward(&mut self, packet: UntrustedPacket) -> Result<(), MeshError> {
-        // Find route - like DNS lookup + routing table check
-        let route = self
-            .router
-            .find_route(&NodeId(packet.header().destination_id))
-            .ok_or_else(|| MeshError::NetworkError("No route to destination".to_string()))?;
-
-        // Convert to trusted packet - like adding proxy headers
-        let trusted = TrustedPacket::from_untrusted(packet);
-
-        // Set forwarding metadata - like proxy configuration
-        let metadata = ForwardingMetadata {
-            hop_count: 0, // Like X-Forwarded-For count
-            ttl: 255,     // Like max-forwards
-            priority: 1,  // Like traffic priority
-        };
-
-        // Forward the packet - like proxy_pass
-        self.network.forward_packet(&trusted, metadata)
+    fn test_time() -> u64 {
+        1000 // Fixed timestamp for testing
     }
 
-    /// Generate a random nonce
-    /// Like generating a request ID or CSRF token
-    fn generate_nonce(&self) -> Result<[u8; 8], MeshError> {
-        use ring::rand::SecureRandom;
-        // Create cryptographically secure RNG - like crypto.randomBytes
+    #[test]
+    fn test_network_creation() {
+        let transmitter = MockTransmitter { can_transmit: true };
         let rng = ring::rand::SystemRandom::new();
-        let mut nonce = [0u8; 8];
-        // Fill with random bytes - like generating session ID
-        rng.fill(&mut nonce)
-            .map_err(|_| MeshError::CryptoError("Failed to generate nonce".to_string()))?;
-        Ok(nonce)
+        let keypair = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let keypair = Ed25519KeyPair::from_pkcs8(keypair.as_ref()).unwrap();
+
+        let time_provider = TimeProvider {
+            get_timestamp: test_time,
+        };
+
+        let network = Network::new(transmitter, keypair, [0u8; 32], true, time_provider);
+
+        assert!(network.is_router);
+        assert!(network.routes.is_some());
     }
 }
