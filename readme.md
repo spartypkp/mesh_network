@@ -1,191 +1,251 @@
-# Mesh Network Radio Packet Validator
+# Mesh Network Implementation
 
-## System Overview
-A secure, efficient mesh network implementation in Rust focusing on packet validation, routing, and secure message passing. Think of it as a "distributed web server" where each node can act as both client and server.
+## Core Concept
+A minimal, secure mesh network focusing on packet routing and cryptographic validation. Implements layers 2 & 3 of the OSI model with support for arbitrary layer 4 protocols.
 
-## Current State
-
-### Core Components Status
-
-1. **Packet Processing (✓ Complete)**
-   - Zero-copy packet parsing with zerocopy
-   - Type-safe packet validation flow
-   - Comprehensive error handling
-   - Efficient memory usage
-
-2. **Network Management (✓ Complete)**
-   - Peer management and trust verification
-   - Rate limiting implementation
-   - Packet forwarding with TTL
-   - Network maintenance routines
-
-3. **Advanced Routing (✓ Complete)**
-   - Path quality calculations
-   - Multi-hop routing
-   - Route discovery and maintenance
-   - Link quality monitoring
-
-4. **Security Layer (✓ Complete)**
-   - Ed25519 signature verification
-   - Nonce tracking for replay prevention
-   - Trust management
-   - Key pair handling
-
-5. **Validation System (✓ Complete)**
-   - Packet size validation
-   - Age verification
-   - Format checking
-   - Source verification
-
-6. **Logging System (✓ Complete)**
-   - Structured async logging
-   - Component tagging
-   - Configurable levels
-   - Performance monitoring
-
-### System Integration
-
-```mermaid
-graph TD
-    A[Incoming Radio Signal] --> B[Packet Processing]
-    B --> C[Validation]
-    C --> D[Crypto Verification]
-    D --> E[Routing Decision]
-    E -->|Local| F[Process]
-    E -->|Forward| G[Network Layer]
-    
-    H[Logger] -.-> B & C & D & E & F & G
+## New File Structure
+```
+src/
+├── lib.rs           # Core Network implementation
+├── packet.rs        # Packet and path vector handling
+├── auth.rs          # Authorization tree (replacing crypto.rs)
+└── error.rs         # Error handling
 ```
 
-### Core Functionality
-1. **Message Passing**
-   ```rust
-   // Send direct message
-   mesh.send_message(target_id, message)?;
-   
-   // Broadcast to network
-   mesh.broadcast(message)?;
-   ```
 
-2. **Peer Management**
-   ```rust
-   // Add trusted peer
-   mesh.add_peer(peer_public_key)?;
-   
-   // Remove peer
-   mesh.remove_peer(peer_id);
-   ```
+# Key Adjustments Needed
 
-3. **Packet Handling**
-   ```rust
-   // Handle incoming packet
-   mesh.handle_packet(radio_data)?;
-   ```
-
-## Testing Coverage
-
-### Unit Tests (✓ Complete)
-1. **Network Tests**
-   - Rate limiting
-   - Peer management
-   - Route calculation
-   - Packet forwarding
-
-2. **Packet Tests**
-   - Parsing
-   - Validation
-   - Size limits
-   - Error cases
-
-3. **Crypto Tests**
-   - Signature verification
-   - Key management
-   - Nonce validation
-
-
-### Integration Tests (✓ Complete)
-- Full message flow
-- Multi-node routing
-- Network formation
-- Error handling
-
-## Remaining Tasks
-
-### 1. Advanced Features
-- [ ] Dynamic peer discovery
-- [ ] Adaptive routing
-- [ ] Network visualization
-- [ ] Performance monitoring
-
-### 2. Documentation
-- [ ] API reference
-- [ ] Integration guide
-- [ ] Best practices
-- [ ] Example applications
-
-### 3. Optimization
-- [ ] Memory usage
-- [ ] CPU utilization
-- [ ] Network efficiency
-- [ ] Battery impact
-
-## Usage Example
-
+## 1. Generic Transmitter
+Our documentation doesn't properly emphasize the `Tx` generic parameter:
 ```rust
-#[tokio::main]
-async fn main() -> Result<(), MeshError> {
-    // Initialize node
-    let mut mesh = MeshNetwork::new(MeshConfig {
-        node_name: "node-1".into(),
-        max_peers: 10,
-        max_packet_size: 64 * 1024,
-        log_level: LogLevel::Info,
-    }).await?;
+// This is more fundamental than we showed
+pub struct Network {
+    transmitter: Tx,  // Abstract byte transmitter
+    // ... other fields
+}
+```
+- Must be a mutable reference to byte transmitter
+- This is the core interface for network communication
 
-    // Add known peers
-    mesh.add_peer(&peer_key)?;
+## 2. CRDT-Style Route Updates
+We need to explicitly document how route updates work:
+- Similar to CRDT Map implementations
+- With added cryptographic validation
+- Need to define conflict resolution strategy
 
-    // Send messages
-    mesh.send_message(target_id, "Hello mesh!")?;
+## 3. Authorization Model Clarification
+Current documentation oversimplifies the authorization tree:
+```rust
+pub struct AuthTree {
+    rights: Rights,
+    ttl: Duration,
+    children: Vec,
+    signatures: Vec,
+}
+```
+Key points missing:
+- Any keypair can sign child nodes
+- Rights are inherited and time-limited
+- Rights delegation for routing capabilities
+
+## 4. Routing Simplification
+Need to better distinguish between:
+- Routing nodes (full path vector)
+- Non-routing nodes (just next hop)
+- Path truncation at each hop
+
+
+## Revised Core Requirements
+
+### Network<Tx>
+```rust
+impl Network {
+    // Core function - more important than we initially showed
+    fn accept(bytes: [u8]) -> Option;
     
-    // Handle incoming
-    mesh.handle_packet(&radio_data)?;
-
-    Ok(())
+    // Supporting functions
+    fn verify_auth_chain(&self, chain: &[Signature]) -> bool;
+    fn update_routes(&mut self, update: RouteUpdate) -> Result;
 }
 ```
 
-## Architecture Decisions
+### Authorization
+- Remove complex crypto operations
+- Focus on signature chain verification
+- Rights delegation with TTL
+- Routing rights management
 
-### 1. Type Safety
-- Using Rust's type system for packet validation
-- Clear distinction between trusted/untrusted data
-- Explicit error handling
+### Routing
+- Simplify to path vectors
+- Remove complex route computation
+- Focus on path truncation
+- Keep track of only necessary information
 
-### 2. Performance
-- Zero-copy parsing where possible
-- Efficient memory management
-- Async operations for I/O
+### Packet Structure
+```rust
+struct Packet {
+    source: PublicKey,
+    destination: PublicKey,
+    path: PathVector,
+    content: Vec,
+    auth_chain: Vec,
+}
+```
 
-### 3. Security
-- Cryptographic validation
-- Trust verification
-- Rate limiting
-- Replay protection
+## Key Changes from Previous Plan
 
-## Next Steps
+### Remove
+- Complex route table structures
+- Separate crypto module
+- Network management functions
+- Complex error handling
 
-### Immediate Priority
-1. Complete API documentation
-2. Add performance benchmarks
-3. Create example applications
+### Add
+- CRDT-style route updates
+- Proper generic transmitter handling
+- Simplified authorization tree
+- Clear node type distinction
 
-### Future Enhancements
-1. Implement peer discovery
-2. Add network visualization
-3. Create monitoring tools
+### Modify
+- Simplify routing to just path vectors
+- Focus on auth chain verification
+- Reduce to essential components only
 
-## Contributing
-1. WillyD
-2. Claude
-3. More Claude
+## MVP Implementation Order
+1. Basic Network<Tx> with accept()
+2. Simple packet validation
+3. Path vector basics
+4. Authorization chains
+5. Route updates (CRDT-style)
+
+
+## Component Specifications
+
+### 1. lib.rs - Core Network Implementation
+**Purpose**: Provide generic network interface with abstract transmitter
+
+**Core Types**:
+```rust
+pub struct Network<Tx> {
+    transmitter: Tx,            // Abstract byte transmitter
+    keypair: Ed25519KeyPair,    // Node keypair
+    network_key: PublicKey,     // Network public key
+    routes: Option<RouteTable>, // Optional for non-routing nodes
+}
+```
+
+**Key Functions**:
+- `new(transmitter: Tx, keypair: KeyPair, network_key: PublicKey) -> Self`
+- `accept(bytes: [u8]) -> Option<TrustedPacket>`
+- `send(dest: PublicKey, content: &[u8]) -> Result<(), Error>`
+- `update_routes(update: RouteUpdate) -> Result<(), Error>`
+
+**Responsibilities**:
+- Abstract transmitter management
+- Packet acceptance and validation
+- Basic routing decisions
+- Authorization verification
+
+### 2. packet.rs - Packet and Path Vector
+**Purpose**: Handle packet structure and path vectors
+
+**Core Types**:
+```rust
+pub struct Packet {
+    source: PublicKey,
+    destination: PublicKey,
+    path: PathVector,
+    content: Vec<u8>,
+    auth_chain: Vec<Signature>,
+}
+
+pub struct PathVector {
+    hops: Vec<PublicKey>,
+    signatures: Vec<Signature>,
+}
+```
+
+**Key Functions**:
+- `from_bytes(data: &[u8]) -> Result<Self, Error>`
+- `to_bytes(&self) -> Vec<u8>`
+- `truncate_path(&mut self)`
+- `verify_path(&self, network_key: &PublicKey) -> bool`
+
+**Responsibilities**:
+- Zero-copy parsing
+- Path vector handling
+- Basic validation
+- Serialization
+
+### 3. auth.rs - Authorization Tree
+**Purpose**: Manage authorization chains and rights delegation
+
+**Core Types**:
+```rust
+pub struct AuthTree {
+    keypair: PublicKey,
+    rights: Rights,
+    ttl: Duration,
+    delegations: Vec<Delegation>,
+}
+
+pub struct Rights {
+    can_route: bool,
+    can_delegate: bool,
+    expires_at: SystemTime,
+}
+```
+
+**Key Functions**:
+- `verify_chain(chain: &[Signature], required_rights: Rights) -> bool`
+- `delegate_rights(to: PublicKey, rights: Rights, ttl: Duration) -> Signature`
+- `verify_routing_rights(chain: &[Signature]) -> bool`
+
+**Responsibilities**:
+- Rights management
+- Authorization chains
+- TTL tracking
+- Delegation verification
+
+### 4. error.rs - Error Types
+**Purpose**: Define core error types
+
+**Core Types**:
+```rust
+pub enum Error {
+    InvalidPacket(String),
+    InvalidAuth(String),
+    RoutingError(String),
+    TransmitError(String),
+}
+```
+
+**Responsibilities**:
+- Error definitions
+- Result type aliases
+- Error context
+
+## Core Workflows
+
+### 1. Packet Processing
+```mermaid
+graph TD
+    A[accept(bytes)] --> B[Parse Packet]
+    B --> C{Validate Auth}
+    C -->|Invalid| D[None]
+    C -->|Valid| E{Routing Node?}
+    E -->|Yes| F[Process Path]
+    E -->|No| G[Check Next Hop]
+    F --> H[Forward/Process]
+    G --> H
+```
+
+### 2. Authorization
+```mermaid
+graph TD
+    A[Verify Rights] --> B{Check Chain}
+    B -->|Invalid| C[Reject]
+    B -->|Valid| D{Check TTL}
+    D -->|Expired| C
+    D -->|Valid| E[Accept]
+```
