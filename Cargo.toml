@@ -4,14 +4,16 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-ring = "0.16"
-zerocopy = "0.6"
-thiserror = "1.0"
-bytes = "1.0"
-tokio = { version = "1.0", features = ["full"] }
-serde_json = "1.0"
-hashbrown = "0.14"
-heapless = "0.8"
+ring = "0.16"        # For cryptographic operations (Ed25519KeyPair)
+hashbrown = "0.14"   # For no_std HashMap implementation
+zerocopy = "0.6"     # For zero-copy serialization
 
-[dev-dependencies]
-tokio-test = "0.4"
+# Removed unnecessary dependencies:
+# - thiserror (using custom Error enums instead)
+# - bytes (using Vec<u8> directly)
+# - tokio (not needed for core mesh networking)
+# - serde_json (not using JSON serialization)
+# - heapless (using alloc with hashbrown instead)
+
+[features]
+default = []

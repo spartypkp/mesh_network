@@ -126,7 +126,8 @@ struct Packet {
 
 **Core Types**:
 ```rust
-pub struct Network<Tx> {
+trait Transmitter { ... }
+pub struct Network<Tx: Transmitter> {
     transmitter: Tx,            // Abstract byte transmitter
     keypair: Ed25519KeyPair,    // Node keypair
     network_key: PublicKey,     // Network public key
@@ -135,10 +136,10 @@ pub struct Network<Tx> {
 ```
 
 **Key Functions**:
-- `new(transmitter: Tx, keypair: KeyPair, network_key: PublicKey) -> Self`
-- `accept(bytes: [u8]) -> Option<TrustedPacket>`
-- `send(dest: PublicKey, content: &[u8]) -> Result<(), Error>`
-- `update_routes(update: RouteUpdate) -> Result<(), Error>`
+- `Network::new(transmitter: Tx, keypair: KeyPair, network_key: PublicKey) -> Self`
+- `Network::accept(&mut self, bytes: [u8]) -> Option<TrustedPacket>`
+- `Network::send(&mut self, dest: PublicKey, content: &[u8]) -> Result<(), Error>`
+- `Network::update_routes(&mut self, update: RouteUpdate) -> Result<(), Error>`
 
 **Responsibilities**:
 - Abstract transmitter management
@@ -152,16 +153,14 @@ pub struct Network<Tx> {
 **Core Types**:
 ```rust
 pub struct Packet {
-    source: PublicKey,
     destination: PublicKey,
-    path: PathVector,
-    content: Vec<u8>,
-    auth_chain: Vec<Signature>,
+    content: PacketBody,
+    sig: Signature, // packet source is the public key of the signature
 }
 
-pub struct PathVector {
-    hops: Vec<PublicKey>,
-    signatures: Vec<Signature>,
+pub enum PacketBody {
+    Forward(Packet),
+    Content([u8]),
 }
 ```
 
