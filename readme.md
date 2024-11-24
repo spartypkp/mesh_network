@@ -160,7 +160,7 @@ pub struct Packet {
 
 pub enum PacketBody {
     Forward(Packet),
-    Content([u8]),
+    `Content`([u8]),
 }
 ```
 
