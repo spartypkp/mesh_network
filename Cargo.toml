@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 ring = "0.16"        # For cryptographic operations (Ed25519KeyPair)
 hashbrown = "0.14"   # For no_std HashMap implementation
-
+crossbeam-channel = { version = "0.5", default-features = false }
 serde = "1.0.215"
 rmp-serde = "1.3.0"
 
