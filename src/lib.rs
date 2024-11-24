@@ -45,163 +45,81 @@ pub enum TransmitError {
     DeviceError,
 }
 
+pub const MAX_PACKET_SIZE: usize = 1024; // Or whatever size limit you need
+
 // Core packet structure
-#[derive(Clone, Debug)]
-pub struct Packet {
-    source: PublicKey,
+#[derive(Clone, Debug, FromBytes, ToBytes)]
+pub struct Packet<'a, const S: usize> {
     destination: PublicKey,
-    path: PathVector,
-    content: Vec<u8>,
-    signatures: Vec<Signature>,
+    content: PacketBody<'a, S>,
+    sig: Signature, // packet source is the public key of the signature
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct PathVector {
-    hops: Vec<PublicKey>,
+#[derive(Clone, Debug, Copy, FromBytes, ToBytes)]
+pub enum PacketBody<'a, const S: usize> {
+    Forward(&'a Packet<'a, S>), // Sending next node this packet to forward. Route already determined by sender (me)
+    Content(&'a Vec<u8>),       // Here's some data yo
+    Routable(&'a Packet<'a, S>), // Here's some packet, I don't know where to send it, fucking deal with it.
 }
-impl PathVector {
-    pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        let mut bytes = Vec::new();
-
-        // Write number of hops
-        bytes.extend_from_slice(&(self.hops.len() as u16).to_le_bytes());
-
-        // Write each hop
-        for hop in &self.hops {
-            bytes.extend_from_slice(&(hop.len() as u16).to_le_bytes());
-            bytes.extend_from_slice(hop);
-        }
-
-        Ok(bytes)
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let mut pos = 0;
-
-        // Read number of hops
-        if bytes.len() < 2 {
-            return Err(Error::Packet(PacketError::InvalidFormat));
-        }
-        let hop_count = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
-        pos += 2;
-
-        let mut hops = Vec::with_capacity(hop_count);
-
-        // Read each hop
-        for _ in 0..hop_count {
-            if pos + 2 > bytes.len() {
-                return Err(Error::Packet(PacketError::InvalidFormat));
-            }
-            let hop_len = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
-            pos += 2;
-
-            if pos + hop_len > bytes.len() {
-                return Err(Error::Packet(PacketError::InvalidFormat));
-            }
-            hops.push(bytes[pos..pos + hop_len].to_vec());
-            pos += hop_len;
-        }
-
-        Ok(Self { hops })
-    }
+// Claude's fix:
+#[derive(AsBytes, FromBytes)]
+#[repr(C)]
+pub struct SignedContent {
+    destination_len: u32,
+    content_len: u32,
 }
+// Evan's implementation:
+// impl<'a, const S: usize> Packet<'a, S> {
+//     pub fn new<K: KeyPair>(
+//         source: K,
+//         destination: PublicKey,
+//         content: &'a Vec<u8>,
+//     ) -> Result<Self> {
+//
+//         let sig = source.sign(content.as_bytes()); // FIXME: security hole (sign dest too)
+//         Ok(Self {
+//             destination,
+//             content: PacketBody::Content(content),
+//             sig,
+//         })
+//     }
+// }
 
-impl Packet {
-    pub fn new(source: PublicKey, destination: PublicKey, content: Vec<u8>) -> Result<Self> {
+impl<'a, const S: usize> Packet<'a, S> {
+    pub fn new(
+        source: &Ed25519KeyPair,
+        destination: PublicKey,
+        content: &'a Vec<u8>,
+    ) -> Result<Self> {
+        // Create the signed content header
+        let header = SignedContent {
+            destination_len: destination.len() as u32,
+            content_len: content.len() as u32,
+        };
+
+        // Calculate total buffer size and create buffer
+        let total_size = mem::size_of::<SignedContent>() + destination.len() + content.len();
+        let mut signing_buffer = Vec::with_capacity(total_size);
+
+        // Build the buffer in a structured way
+        signing_buffer.extend_from_slice(header.as_bytes());
+        signing_buffer.extend_from_slice(&destination);
+        signing_buffer.extend_from_slice(content);
+
+        let sig = source.sign(&signing_buffer).as_ref().to_vec();
+
         Ok(Self {
-            source,
             destination,
-            path: PathVector::default(),
-            content,
-            signatures: Vec::new(),
+            content: PacketBody::Content(content),
+            sig,
         })
     }
 
     pub fn destination(&self) -> &[u8] {
         &self.destination
     }
-
-    pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        // Serialize packet format:
-        // [source_len(2)][source][dest_len(2)][dest][path_len(2)][path][content_len(4)][content][sigs_count(2)][sigs]
-        let mut bytes = Vec::new();
-
-        // Add source
-        bytes.extend_from_slice(&(self.source.len() as u16).to_le_bytes());
-        bytes.extend_from_slice(&self.source);
-
-        // Add destination
-        bytes.extend_from_slice(&(self.destination.len() as u16).to_le_bytes());
-        bytes.extend_from_slice(&self.destination);
-
-        // Add path
-        let path_bytes = self.path.to_bytes()?;
-        bytes.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
-        bytes.extend_from_slice(&path_bytes);
-
-        // Add content
-        bytes.extend_from_slice(&(self.content.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(&self.content);
-
-        // Add signatures
-        bytes.extend_from_slice(&(self.signatures.len() as u16).to_le_bytes());
-        for sig in &self.signatures {
-            bytes.extend_from_slice(&(sig.len() as u16).to_le_bytes());
-            bytes.extend_from_slice(sig);
-        }
-
-        Ok(bytes)
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let mut pos = 0;
-
-        // Read source
-        let source_len = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
-        pos += 2;
-        let source = bytes[pos..pos + source_len].to_vec();
-        pos += source_len;
-
-        // Read destination
-        let dest_len = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
-        pos += 2;
-        let destination = bytes[pos..pos + dest_len].to_vec();
-        pos += dest_len;
-
-        // Read path
-        let path_len = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
-        pos += 2;
-        let path = PathVector::from_bytes(&bytes[pos..pos + path_len])?;
-        pos += path_len;
-
-        // Read content
-        let content_len =
-            u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
-                as usize;
-        pos += 4;
-        let content = bytes[pos..pos + content_len].to_vec();
-        pos += content_len;
-
-        // Read signatures
-        let sig_count = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
-        pos += 2;
-        let mut signatures = Vec::with_capacity(sig_count);
-
-        for _ in 0..sig_count {
-            let sig_len = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
-            pos += 2;
-            signatures.push(bytes[pos..pos + sig_len].to_vec());
-            pos += sig_len;
-        }
-
-        Ok(Self {
-            source,
-            destination,
-            path,
-            content,
-            signatures,
-        })
-    }
+    // Implementing a serialization format for the Packet structure
+    // Convert
 }
 
 // Authorization structure
